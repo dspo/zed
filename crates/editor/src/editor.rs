@@ -20183,36 +20183,11 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         let focus_handle = self.focus_handle.clone();
-        // Determine if this hunk is first/last to disable corresponding actions
-        let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
-        let mut first_row: Option<MultiBufferRow> = None;
-        let mut last_row: Option<MultiBufferRow> = None;
-        let mut current_row: Option<MultiBufferRow> = None;
-
-        for hunk in buffer_snapshot.diff_hunks_in_range(Anchor::min()..Anchor::max()) {
-            let row = hunk.row_range.start;
-            if first_row.is_none() {
-                first_row = Some(row);
-            }
-            last_row = Some(row);
-            if hunk.multi_buffer_range() == hunk_range {
-                current_row = Some(row);
-            }
-        }
-
-        let is_first = current_row.is_some_and(|r| Some(r) == first_row);
-        let is_last = current_row.is_some_and(|r| Some(r) == last_row);
 
         let context_menu = ui::ContextMenu::build(window, cx, |menu, _, _cx| {
             menu.on_blur_subscription(Subscription::new(|| {}))
                 .context(focus_handle)
                 .action("Revert ^ ⌘ →", Restore.boxed_clone())
-                .action_disabled_when(
-                    is_first,
-                    "Prev Hunk ^ ⌘ ↑",
-                    actions::GoToPreviousHunk.boxed_clone(),
-                )
-                .action_disabled_when(is_last, "Next Hunk ^ ⌘ ↓", actions::GoToHunk.boxed_clone())
         });
 
         self.mouse_context_menu = MouseContextMenu::pinned_to_editor(

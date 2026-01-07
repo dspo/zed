@@ -1290,6 +1290,7 @@ impl GitPanel {
                         buffer,
                         diff,
                         path_buf,
+                        "HEAD".to_string(),  // Base label for uncommitted changes
                         project,
                         workspace,
                         window,

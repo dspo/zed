@@ -10,13 +10,14 @@
 use anyhow::Result;
 use buffer_diff::{BufferDiff, BufferDiffEvent, DiffHunkStatusKind};
 use editor::{
-    Editor, EditorEvent, ExcerptRange, RowHighlightOptions,
+    Editor, EditorEvent, ExcerptRange, RowHighlightOptions, ToPoint,
     display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId},
+    scroll::Autoscroll,
 };
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled, Subscription, Task,
-    Window, div,
+    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render, Styled, Subscription, Task,
+    Window, actions, div,
 };
 use language::{Buffer, Capability, Point};
 use multi_buffer::MultiBuffer;
@@ -28,13 +29,30 @@ use std::{
     sync::Arc,
 };
 use ui::{
-    ActiveTheme, Color, Icon, IconName, Label, LabelCommon as _, SharedString,
-    prelude::*,
+    ActiveTheme, Color, Icon, IconButton, IconName, Label, LabelCommon as _, SharedString,
+    Tooltip, prelude::*,
 };
 use workspace::{
     Item, ItemNavHistory, Workspace,
     item::{ItemEvent, TabContentParams},
 };
+
+// Actions for hunk navigation in side-by-side diff view
+actions!(
+    side_by_side_diff,
+    [
+        GoToNextHunk,
+        GoToPreviousHunk,
+    ]
+);
+
+/// Register keybindings for side-by-side diff view
+pub fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("alt-]", GoToNextHunk, Some("SideBySideDiffView")),
+        KeyBinding::new("alt-[", GoToPreviousHunk, Some("SideBySideDiffView")),
+    ]);
+}
 
 /// Marker type for deletion highlighting in left editor (row-level)
 struct DeletionHighlight;
@@ -66,6 +84,8 @@ pub struct SideBySideDiffView {
     new_buffer: Entity<Buffer>,
     /// Path being compared
     path: PathBuf,
+    /// Label for the base/left side (e.g., "HEAD", branch name, or commit hash)
+    base_label: String,
     /// Focus handle for the view
     focus_handle: FocusHandle,
     /// Prevent recursive scroll sync
@@ -78,6 +98,7 @@ pub struct SideBySideDiffView {
     _subscriptions: Vec<Subscription>,
 }
 
+
 impl SideBySideDiffView {
     /// Create a new side-by-side diff view for a file
     pub fn new(
@@ -85,6 +106,7 @@ impl SideBySideDiffView {
         new_buffer: Entity<Buffer>,
         diff: Entity<BufferDiff>,
         path: PathBuf,
+        base_label: String,
         project: Option<Entity<Project>>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -155,7 +177,8 @@ impl SideBySideDiffView {
             &left_editor,
             window,
             move |this, _, event: &EditorEvent, window, cx| {
-                if let EditorEvent::ScrollPositionChanged{..} = event {
+                // Match all local scroll events (both autoscroll and manual scroll)
+                if let EditorEvent::ScrollPositionChanged { local: true, .. } = event {
                     println!("[SideBySideDiffView] Left editor scrolled: {:?}", event);
                     if !this.is_syncing_scroll.get() {
                         this.is_syncing_scroll.set(true);
@@ -177,7 +200,9 @@ impl SideBySideDiffView {
             &right_editor,
             window,
             move |this, _, event: &EditorEvent, window, cx| {
-                if let EditorEvent::ScrollPositionChanged { local: true, autoscroll: false } = event {
+                // Match all local scroll events (both autoscroll and manual scroll)
+                if let EditorEvent::ScrollPositionChanged { local: true, .. } = event {
+                    println!("[SideBySideDiffView] Right editor scrolled: {:?}", event);
                     if !this.is_syncing_scroll.get() {
                         this.is_syncing_scroll.set(true);
                         let scroll_position = this.right_editor.update(cx, |editor, cx| {
@@ -211,6 +236,7 @@ impl SideBySideDiffView {
             old_buffer,
             new_buffer,
             path,
+            base_label,
             focus_handle,
             is_syncing_scroll: Cell::new(false),
             left_alignment_blocks: Vec::new(),
@@ -230,6 +256,7 @@ impl SideBySideDiffView {
         new_buffer: Entity<Buffer>,
         diff: Entity<BufferDiff>,
         path: PathBuf,
+        base_label: String,
         project: Entity<Project>,
         workspace: &mut Workspace,
         window: &mut Window,
@@ -241,6 +268,7 @@ impl SideBySideDiffView {
                 new_buffer,
                 diff,
                 path,
+                base_label,
                 Some(project),
                 window,
                 cx,
@@ -720,6 +748,136 @@ impl SideBySideDiffView {
         });
     }
 
+    /// Calculate whether there are hunks before/after the current cursor position
+    /// Returns (has_prev_hunk, has_next_hunk)
+    fn hunk_navigation_state(&self, cx: &App) -> (bool, bool) {
+        let new_buffer_snapshot = self.new_buffer.read(cx).snapshot();
+        let diff_snapshot = self.diff.read(cx).snapshot(cx);
+        let hunks: Vec<_> = diff_snapshot.hunks(&new_buffer_snapshot).collect();
+
+        if hunks.is_empty() {
+            return (false, false);
+        }
+
+        // Get current cursor position in the right editor (new buffer)
+        // Use newest_anchor and convert to point via multibuffer snapshot
+        let right_editor = self.right_editor.read(cx);
+        let mb_snapshot = right_editor.buffer().read(cx).snapshot(cx);
+        let newest_anchor = right_editor.selections.newest_anchor();
+        let current_row = newest_anchor.head().to_point(&mb_snapshot).row;
+
+        let has_prev = hunks.iter().any(|hunk| hunk.range.start.row < current_row);
+        let has_next = hunks.iter().any(|hunk| hunk.range.start.row > current_row);
+
+        (has_prev, has_next)
+    }
+
+    /// Navigate to the next hunk in the diff
+    fn go_to_next_hunk(&mut self, _: &GoToNextHunk, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigate_to_hunk(true, window, cx);
+    }
+
+    /// Navigate to the previous hunk in the diff
+    fn go_to_previous_hunk(&mut self, _: &GoToPreviousHunk, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigate_to_hunk(false, window, cx);
+    }
+
+    /// Navigate to the next or previous hunk
+    /// 
+    /// This method:
+    /// 1. Finds all hunks in the diff
+    /// 2. Determines the current position based on the right editor's cursor
+    /// 3. Finds the target hunk (next or previous)
+    /// 4. Scrolls the target hunk to a position slightly above center (for better UX)
+    /// 5. Places the cursor at the beginning of the hunk's first line
+    /// 6. Syncs the scroll position to the left editor
+    fn navigate_to_hunk(&mut self, next: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // Get hunks from the diff
+        let new_buffer_snapshot = self.new_buffer.read(cx).snapshot();
+        let diff_snapshot = self.diff.read(cx).snapshot(cx);
+        let hunks: Vec<_> = diff_snapshot.hunks(&new_buffer_snapshot).collect();
+
+        if hunks.is_empty() {
+            return;
+        }
+
+        // Get current cursor position in the right editor (new buffer)
+        let current_row = self.right_editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            let selection = editor.selections.newest::<Point>(&snapshot);
+            selection.head().row
+        });
+
+        // Find the target hunk index
+        let target_index = if next {
+            // Find the first hunk that starts after the current row
+            hunks.iter().position(|hunk| hunk.range.start.row > current_row)
+                .or_else(|| {
+                    // If no hunk after current, wrap to first
+                    if !hunks.is_empty() { Some(0) } else { None }
+                })
+        } else {
+            // Find the last hunk that starts before the current row
+            let mut found_idx = None;
+            for (i, hunk) in hunks.iter().enumerate().rev() {
+                if hunk.range.start.row < current_row {
+                    found_idx = Some(i);
+                    break;
+                }
+            }
+            found_idx.or_else(|| {
+                // If no hunk before current, wrap to last
+                if !hunks.is_empty() { Some(hunks.len() - 1) } else { None }
+            })
+        };
+
+        let Some(target_index) = target_index else {
+            return;
+        };
+
+        let target_hunk = &hunks[target_index];
+        let target_row = target_hunk.range.start.row;
+
+        // Navigate to the target hunk in the right editor
+        // Use Autoscroll::top_relative to position the hunk slightly above center
+        // This provides a better user experience as the user can see more context below
+        self.right_editor.update(cx, |editor, cx| {
+            let destination = Point::new(target_row, 0);
+            
+            // Unfold the destination if needed
+            editor.unfold_ranges(&[destination..destination], false, false, cx);
+            
+            // Move cursor to the hunk's first line and scroll with smooth animation feel
+            // Using top_relative(5) to position the hunk ~5 lines from top (above center)
+            editor.change_selections(
+                editor::SelectionEffects::scroll(Autoscroll::top_relative(5)),
+                window,
+                cx,
+                |s| {
+                    s.select_ranges([destination..destination]);
+                },
+            );
+        });
+
+        // Focus the right editor to ensure cursor is visible
+        self.right_editor.update(cx, |_editor, cx| {
+            cx.focus_self(window);
+        });
+
+        // Sync scroll position to left editor after a short delay
+        // to ensure the right editor has finished scrolling
+        let left_editor = self.left_editor.clone();
+        let right_editor = self.right_editor.clone();
+        window.defer(cx, move |window, cx| {
+            let scroll_position = right_editor.update(cx, |editor, cx| {
+                editor.scroll_position(cx)
+            });
+            left_editor.update(cx, |editor, cx| {
+                editor.set_scroll_position(scroll_position, window, cx);
+            });
+        });
+    }
+
     /// Render the diff gutter with change indicators
     #[allow(dead_code)]
     fn render_diff_gutter(&self, _cx: &App) -> AnyElement {
@@ -744,10 +902,19 @@ impl Render for SideBySideDiffView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
+        // Get the filename for display
+        let filename = self.path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string());
+        let left_title = format!("{} @ {} (Read-only)", filename, self.base_label);
+        let right_title = format!("{} (Worktree)", filename);
+        
         div()
             .id("side-by-side-diff-view")
             .track_focus(&self.focus_handle)
             .key_context("SideBySideDiffView")
+            .on_action(cx.listener(Self::go_to_next_hunk))
+            .on_action(cx.listener(Self::go_to_previous_hunk))
             .size_full()
             .flex()
             .flex_row()
@@ -771,7 +938,7 @@ impl Render for SideBySideDiffView {
                             .border_b_1()
                             .border_color(theme.colors().border)
                             .child(
-                                Label::new("Base (Read-only)")
+                                Label::new(left_title)
                                     .size(ui::LabelSize::Small)
                                     .color(Color::Muted),
                             )
@@ -786,25 +953,62 @@ impl Render for SideBySideDiffView {
             // Center gutter with connectors (optional)
             // .child(self.render_diff_gutter(cx))
             // Right panel header + editor
-            .child(
+            .child({
+                // Calculate hunk navigation state
+                let (has_prev, has_next) = self.hunk_navigation_state(cx);
+                let focus_handle = self.focus_handle.clone();
+                
                 div()
                     .flex_1()
                     .flex()
                     .flex_col()
-                    // Header
+                    // Header with navigation buttons
                     .child(
                         div()
                             .h(px(32.))
                             .px_2()
                             .flex()
                             .items_center()
+                            .justify_between()
                             .bg(theme.colors().title_bar_background)
                             .border_b_1()
                             .border_color(theme.colors().border)
                             .child(
-                                Label::new("Worktree (Editable)")
+                                Label::new(right_title.clone())
                                     .size(ui::LabelSize::Small)
                                     .color(Color::Accent),
+                            )
+                            // Navigation buttons
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_1()
+                                    .child(
+                                        IconButton::new("prev-hunk", IconName::ArrowUp)
+                                            .icon_size(ui::IconSize::Small)
+                                            .tooltip(Tooltip::for_action_title_in(
+                                                "Previous Hunk",
+                                                &GoToPreviousHunk,
+                                                &focus_handle,
+                                            ))
+                                            .disabled(!has_prev)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.navigate_to_hunk(false, window, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        IconButton::new("next-hunk", IconName::ArrowDown)
+                                            .icon_size(ui::IconSize::Small)
+                                            .tooltip(Tooltip::for_action_title_in(
+                                                "Next Hunk",
+                                                &GoToNextHunk,
+                                                &focus_handle,
+                                            ))
+                                            .disabled(!has_next)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.navigate_to_hunk(true, window, cx);
+                                            })),
+                                    )
                             )
                     )
                     // Right editor
@@ -813,7 +1017,7 @@ impl Render for SideBySideDiffView {
                             .flex_1()
                             .child(self.right_editor.clone())
                     )
-            )
+            })
     }
 }
 
