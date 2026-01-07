@@ -46,7 +46,8 @@ pub struct FakeGitRepositoryState {
     pub head_contents: HashMap<RepoPath, String>,
     pub index_contents: HashMap<RepoPath, String>,
     // everything in commit contents is in oids
-    pub merge_base_contents: HashMap<RepoPath, Oid>,
+    pub merge_base_contents: HashMap<RepoPath, String>,
+    pub merge_head_contents: HashMap<RepoPath, String>,
     pub oids: HashMap<Oid, String>,
     pub blames: HashMap<RepoPath, Blame>,
     pub current_branch_name: Option<String>,
@@ -70,6 +71,7 @@ impl FakeGitRepositoryState {
             simulated_index_write_error_message: Default::default(),
             refs: HashMap::from_iter([("HEAD".into(), "abc".into())]),
             merge_base_contents: Default::default(),
+            merge_head_contents: Default::default(),
             oids: Default::default(),
             remotes: HashMap::default(),
         }
@@ -103,6 +105,33 @@ impl GitRepository for FakeGitRepository {
                 .get(&path)
                 .context("not present in index")
                 .cloned()
+        });
+        self.executor
+            .spawn_labeled(*LOAD_INDEX_TEXT_TASK, async move { fut.await.ok() })
+            .boxed()
+    }
+
+    fn load_merge_stage_text(&self, path: RepoPath, stage: i32) -> BoxFuture<'_, Option<String>> {
+        let fut = self.with_state_async(false, move |state| {
+            // For fake repository, simulate merge stages based on stage number
+            match stage {
+                1 => state
+                    .merge_base_contents
+                    .get(&path)
+                    .context("not present in merge base")
+                    .cloned(),
+                2 => state
+                    .head_contents
+                    .get(&path)
+                    .context("not present in HEAD")
+                    .cloned(),
+                3 => state
+                    .merge_head_contents
+                    .get(&path)
+                    .context("not present in MERGE_HEAD")
+                    .cloned(),
+                _ => anyhow::bail!("invalid merge stage: {}", stage),
+            }
         });
         self.executor
             .spawn_labeled(*LOAD_INDEX_TEXT_TASK, async move { fut.await.ok() })

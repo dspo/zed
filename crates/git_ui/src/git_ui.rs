@@ -46,8 +46,11 @@ pub mod picker_prompt;
 pub mod project_diff;
 pub(crate) mod remote_output;
 pub mod repository_selector;
+pub mod side_by_side_diff_view;
 pub mod stash_picker;
 pub mod text_diff_view;
+pub mod three_way_merge_editor;
+pub mod three_way_merge_view;
 pub mod worktree_picker;
 
 actions!(

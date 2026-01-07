@@ -98,6 +98,10 @@ pub struct ConflictRegion {
     pub ours: Range<Anchor>,
     pub theirs: Range<Anchor>,
     pub base: Option<Range<Anchor>>,
+    // Full text from Git index stages for 3-way merge view
+    pub base_text: Option<String>,
+    pub ours_text: Option<String>,
+    pub theirs_text: Option<String>,
 }
 
 impl ConflictRegion {
@@ -126,6 +130,11 @@ impl ConflictRegion {
         buffer.update(cx, |buffer, cx| {
             buffer.edit(deletions, None, cx);
         });
+    }
+
+    /// Check if this conflict has loaded merge stage texts
+    pub fn has_stage_texts(&self) -> bool {
+        self.base_text.is_some() || self.ours_text.is_some() || self.theirs_text.is_some()
     }
 }
 
@@ -169,6 +178,32 @@ impl ConflictSet {
     ) {
         self.snapshot = snapshot;
         cx.emit(update);
+    }
+
+    /// Load merge stage texts from Git for all conflicts
+    pub fn load_merge_stage_texts(
+        conflicts: Vec<ConflictRegion>,
+        repo: Arc<dyn git::repository::GitRepository>,
+        repo_path: git::repository::RepoPath,
+        executor: gpui::BackgroundExecutor,
+    ) -> gpui::Task<Vec<ConflictRegion>> {
+        executor.spawn(async move {
+            let mut enriched_conflicts = Vec::new();
+            
+            for mut conflict in conflicts {
+                let base_text = repo.load_merge_stage_text(repo_path.clone(), 1).await;
+                let ours_text = repo.load_merge_stage_text(repo_path.clone(), 2).await;
+                let theirs_text = repo.load_merge_stage_text(repo_path.clone(), 3).await;
+                
+                conflict.base_text = base_text;
+                conflict.ours_text = ours_text;
+                conflict.theirs_text = theirs_text;
+                
+                enriched_conflicts.push(conflict);
+            }
+            
+            enriched_conflicts
+        })
     }
 
     pub fn parse(buffer: &text::BufferSnapshot) -> ConflictSetSnapshot {
@@ -253,6 +288,10 @@ impl ConflictSet {
                     ours,
                     theirs,
                     base,
+                    // Text will be loaded lazily from Git index stages
+                    base_text: None,
+                    ours_text: None,
+                    theirs_text: None,
                 });
 
                 conflict_start = None;

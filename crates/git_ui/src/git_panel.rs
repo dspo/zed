@@ -63,7 +63,7 @@ use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore, StatusStyle};
 use std::future::Future;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::{sync::Arc, time::Duration, usize};
 use strum::{IntoEnumIterator, VariantNames};
 use time::OffsetDateTime;
@@ -111,6 +111,10 @@ actions!(
         ExpandSelectedEntry,
         /// Collapses the selected entry to hide its children.
         CollapseSelectedEntry,
+        /// Opens a side-by-side diff view for the selected entry.
+        OpenSideBySideDiff,
+        /// Opens a three-way merge editor for the selected conflicted file.
+        OpenMergeEditor,
     ]
 );
 
@@ -1222,6 +1226,149 @@ impl GitPanel {
                 })
                 .ok();
             self.focus_handle.focus(window, cx);
+
+            Some(())
+        });
+    }
+
+    fn open_side_by_side_diff(
+        &mut self,
+        _: &OpenSideBySideDiff,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        maybe!({
+            let entry = self.entries.get(self.selected_entry?)?.status_entry()?;
+            let active_repo = self.active_repository.as_ref()?;
+            let project = self.project.clone();
+            
+            // Get the file path
+            let path = active_repo
+                .read(cx)
+                .repo_path_to_project_path(&entry.repo_path, cx)?;
+            
+            if entry.status.is_deleted() {
+                // Cannot open side-by-side for deleted files
+                return None;
+            }
+            
+            // Get the file path for display
+            let path_buf = PathBuf::from(path.path.as_unix_str());
+            
+            // Open the buffer
+            let open_buffer_task = project.update(cx, |project, cx| {
+                project.open_buffer(path.clone(), cx)
+            });
+            
+            // Open the uncommitted diff (HEAD vs worktree)
+            let workspace_weak = self.workspace.clone();
+            let mut async_cx = window.to_async(cx);
+            
+            cx.spawn_in(window, async move |_, _cx| {
+                let buffer = open_buffer_task.await?;
+                
+                // Open the diff for this buffer
+                let diff_task = project.update(&mut async_cx, |project, cx| {
+                    project.open_uncommitted_diff(buffer.clone(), cx)
+                })?;
+                let diff: Entity<buffer_diff::BufferDiff> = diff_task.await?;
+                
+                // Get the base text as a buffer
+                let base_text: Option<String> = diff.update(&mut async_cx, |diff, cx| {
+                    diff.base_text_string(cx)
+                })?;
+                let base_text = base_text.unwrap_or_default();
+                
+                // Create a buffer for the old text
+                let old_buffer = async_cx.new(|cx| {
+                    language::Buffer::local(base_text, cx)
+                })?;
+                
+                workspace_weak.update_in(&mut async_cx, |workspace, window, cx| {
+                    crate::side_by_side_diff_view::SideBySideDiffView::open(
+                        old_buffer,
+                        buffer,
+                        diff,
+                        path_buf,
+                        project,
+                        workspace,
+                        window,
+                        cx,
+                    );
+                })?;
+                
+                anyhow::Ok(())
+            }).detach_and_log_err(cx);
+
+            Some(())
+        });
+    }
+
+    fn open_merge_editor(
+        &mut self,
+        _: &OpenMergeEditor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        maybe!({
+            let entry = self.entries.get(self.selected_entry?)?.status_entry()?;
+            
+            // Only open merge editor for conflicted files
+            if !entry.status.is_conflicted() {
+                return None;
+            }
+            
+            let active_repo = self.active_repository.as_ref()?;
+            let project = self.project.clone();
+            
+            // Get the file path
+            let path = active_repo
+                .read(cx)
+                .repo_path_to_project_path(&entry.repo_path, cx)?;
+            
+            let path_buf = PathBuf::from(path.path.as_unix_str());
+            
+            // Open the buffer
+            let open_buffer_task = project.update(cx, |project, cx| {
+                project.open_buffer(path.clone(), cx)
+            });
+            
+            let project_clone = project.clone();
+            let workspace_weak = self.workspace.clone();
+            let git_store = project.read(cx).git_store().clone();
+            let mut async_cx = window.to_async(cx);
+            
+            cx.spawn_in(window, async move |_, _cx| {
+                let buffer = open_buffer_task.await?;
+                
+                // Get the conflict set for this buffer
+                let conflict_set = git_store.update(&mut async_cx, |git_store, cx| {
+                    git_store.open_conflict_set(buffer.clone(), cx)
+                })?;
+                
+                // Get the first conflict region (if any)
+                let conflict = conflict_set.update(&mut async_cx, |conflict_set, _cx| {
+                    conflict_set.snapshot.conflicts.first().cloned()
+                })?;
+                
+                let Some(conflict) = conflict else {
+                    return anyhow::Ok(());
+                };
+                
+                workspace_weak.update_in(&mut async_cx, |workspace, window, cx| {
+                    crate::three_way_merge_editor::ThreeWayMergeEditor::open(
+                        conflict,
+                        buffer,
+                        path_buf,
+                        project_clone,
+                        workspace,
+                        window,
+                        cx,
+                    );
+                })?;
+                
+                anyhow::Ok(())
+            }).detach_and_log_err(cx);
 
             Some(())
         });
@@ -4817,6 +4964,7 @@ impl GitPanel {
         };
         let context_menu = ContextMenu::build(window, cx, |context_menu, _, _| {
             let is_created = entry.status.is_created();
+            let has_conflict = entry.status.is_conflicted();
             context_menu
                 .context(self.focus_handle.clone())
                 .action(stage_title, ToggleStaged.boxed_clone())
@@ -4828,6 +4976,10 @@ impl GitPanel {
                 )
                 .separator()
                 .action("Open Diff", menu::Confirm.boxed_clone())
+                .action("Open Side-by-Side Diff", OpenSideBySideDiff.boxed_clone())
+                .when(has_conflict, |menu| {
+                    menu.action("Open Merge Editor", OpenMergeEditor.boxed_clone())
+                })
                 .action("Open File", menu::SecondaryConfirm.boxed_clone())
                 .separator()
                 .action_disabled_when(is_created, "View File History", Box::new(git::FileHistory))
@@ -5463,6 +5615,8 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::last_entry))
             .on_action(cx.listener(Self::close_panel))
             .on_action(cx.listener(Self::open_diff))
+            .on_action(cx.listener(Self::open_side_by_side_diff))
+            .on_action(cx.listener(Self::open_merge_editor))
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::file_history))
             .on_action(cx.listener(Self::focus_changes_list))

@@ -14,6 +14,8 @@ use std::{ops::Range, sync::Arc};
 use ui::{ActiveTheme, Element as _, Styled, Window, prelude::*};
 use util::{ResultExt as _, debug_panic, maybe};
 
+use crate::three_way_merge_view::ThreeWayMergeView;
+
 pub(crate) struct ConflictAddon {
     buffers: HashMap<BufferId, BufferConflicts>,
 }
@@ -286,13 +288,14 @@ fn conflicts_updated(
         };
 
         let editor_handle = editor_handle.clone();
+        let buffer_snapshot_for_block = buffer_snapshot.clone();
         blocks.push(BlockProperties {
             placement: BlockPlacement::Above(anchor),
             height: Some(1),
             style: BlockStyle::Fixed,
             render: Arc::new({
                 let conflict = conflict.clone();
-                move |cx| render_conflict_buttons(&conflict, excerpt_id, editor_handle.clone(), cx)
+                move |cx| render_conflict_buttons(&conflict, excerpt_id, editor_handle.clone(), &buffer_snapshot_for_block, cx)
             }),
             priority: 0,
         })
@@ -365,76 +368,83 @@ fn render_conflict_buttons(
     conflict: &ConflictRegion,
     excerpt_id: ExcerptId,
     editor: WeakEntity<Editor>,
+    buffer_text: &language::BufferSnapshot,
     cx: &mut BlockContext,
 ) -> AnyElement {
-    h_flex()
-        .id(cx.block_id)
-        .h(cx.line_height)
-        .ml(cx.margins.gutter.width)
-        .items_end()
-        .gap_1()
-        .bg(cx.theme().colors().editor_background)
-        .child(
-            Button::new("head", format!("Use {}", conflict.ours_branch_name))
-                .label_size(LabelSize::Small)
-                .on_click({
-                    let editor = editor.clone();
-                    let conflict = conflict.clone();
-                    let ours = conflict.ours.clone();
-                    move |_, window, cx| {
-                        resolve_conflict(
-                            editor.clone(),
-                            excerpt_id,
-                            conflict.clone(),
-                            vec![ours.clone()],
-                            window,
-                            cx,
-                        )
-                        .detach()
-                    }
-                }),
-        )
-        .child(
-            Button::new("origin", format!("Use {}", conflict.theirs_branch_name))
-                .label_size(LabelSize::Small)
-                .on_click({
-                    let editor = editor.clone();
-                    let conflict = conflict.clone();
-                    let theirs = conflict.theirs.clone();
-                    move |_, window, cx| {
-                        resolve_conflict(
-                            editor.clone(),
-                            excerpt_id,
-                            conflict.clone(),
-                            vec![theirs.clone()],
-                            window,
-                            cx,
-                        )
-                        .detach()
-                    }
-                }),
-        )
-        .child(
-            Button::new("both", "Use Both")
-                .label_size(LabelSize::Small)
-                .on_click({
-                    let conflict = conflict.clone();
-                    let ours = conflict.ours.clone();
-                    let theirs = conflict.theirs.clone();
-                    move |_, window, cx| {
-                        resolve_conflict(
-                            editor.clone(),
-                            excerpt_id,
-                            conflict.clone(),
-                            vec![ours.clone(), theirs.clone()],
-                            window,
-                            cx,
-                        )
-                        .detach()
-                    }
-                }),
-        )
-        .into_any()
+    // Always use IntelliJ-style 3-way merge view when base is available
+    if conflict.base.is_some() {
+        ThreeWayMergeView::render_three_way_view(conflict, excerpt_id, editor, buffer_text, cx)
+    } else {
+        // Fallback to simple 2-way button view if no base available
+        h_flex()
+            .id(cx.block_id)
+            .h(cx.line_height)
+            .ml(cx.margins.gutter.width)
+            .items_end()
+            .gap_1()
+            .bg(cx.theme().colors().editor_background)
+            .child(
+                Button::new("head", format!("Use {}", conflict.ours_branch_name))
+                    .label_size(LabelSize::Small)
+                    .on_click({
+                        let editor = editor.clone();
+                        let conflict = conflict.clone();
+                        let ours = conflict.ours.clone();
+                        move |_, window, cx| {
+                            resolve_conflict(
+                                editor.clone(),
+                                excerpt_id,
+                                conflict.clone(),
+                                vec![ours.clone()],
+                                window,
+                                cx,
+                            )
+                            .detach()
+                        }
+                    }),
+            )
+            .child(
+                Button::new("origin", format!("Use {}", conflict.theirs_branch_name))
+                    .label_size(LabelSize::Small)
+                    .on_click({
+                        let editor = editor.clone();
+                        let conflict = conflict.clone();
+                        let theirs = conflict.theirs.clone();
+                        move |_, window, cx| {
+                            resolve_conflict(
+                                editor.clone(),
+                                excerpt_id,
+                                conflict.clone(),
+                                vec![theirs.clone()],
+                                window,
+                                cx,
+                            )
+                            .detach()
+                        }
+                    }),
+            )
+            .child(
+                Button::new("both", "Use Both")
+                    .label_size(LabelSize::Small)
+                    .on_click({
+                        let conflict = conflict.clone();
+                        let ours = conflict.ours.clone();
+                        let theirs = conflict.theirs.clone();
+                        move |_, window, cx| {
+                            resolve_conflict(
+                                editor.clone(),
+                                excerpt_id,
+                                conflict.clone(),
+                                vec![ours.clone(), theirs.clone()],
+                                window,
+                                cx,
+                            )
+                            .detach()
+                        }
+                    }),
+            )
+            .into_any()
+    }
 }
 
 pub(crate) fn resolve_conflict(
