@@ -933,14 +933,6 @@ impl Item for ProjectDiff {
         self.editor.update(cx, |editor, cx| {
             editor.added_to_workspace(workspace, window, cx)
         });
-
-        // 使用 defer 延迟激活 split 视图，避免 re-entrant panic
-        let editor = self.editor.clone();
-        window.defer(cx, move |window, cx| {
-            editor.update(cx, |editor, cx| {
-                editor.activate_split(window, cx);
-            });
-        });
     }
 }
 

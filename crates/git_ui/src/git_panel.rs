@@ -1255,6 +1255,25 @@ impl GitPanel {
             // Get the file path for display
             let path_buf = PathBuf::from(path.path.as_unix_str());
             
+            // Get commit info from repository snapshot (head_commit contains CommitDetails)
+            let (base_label, base_commit_message) = {
+                let repo = active_repo.read(cx);
+                if let Some(head_commit) = &repo.head_commit {
+                    // Use short commit hash (first 7 characters)
+                    let short_sha = if head_commit.sha.len() >= 7 {
+                        head_commit.sha[..7].to_string()
+                    } else {
+                        head_commit.sha.to_string()
+                    };
+                    // Use the commit message for hover tooltip
+                    let message = head_commit.message.to_string();
+                    (short_sha, Some(message))
+                } else {
+                    // Fallback to "HEAD" if no commit info available
+                    ("HEAD".to_string(), None)
+                }
+            };
+            
             // Open the buffer
             let open_buffer_task = project.update(cx, |project, cx| {
                 project.open_buffer(path.clone(), cx)
@@ -1290,7 +1309,8 @@ impl GitPanel {
                         buffer,
                         diff,
                         path_buf,
-                        "HEAD".to_string(),  // Base label for uncommitted changes
+                        base_label,
+                        base_commit_message,
                         project,
                         workspace,
                         window,

@@ -15,9 +15,9 @@ use editor::{
     scroll::Autoscroll,
 };
 use gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    AnyElement, App, AppContext as _, Context, DragMoveEvent, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render, Styled, Subscription, Task,
-    Window, actions, div,
+    Window, actions, div, relative,
 };
 use language::{Buffer, Capability, Point};
 use multi_buffer::MultiBuffer;
@@ -54,6 +54,19 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
+/// Drag state for the resizable divider between left and right panels
+#[derive(Clone)]
+struct DraggedDivider;
+
+impl Render for DraggedDivider {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// Size of the draggable resize handle
+const RESIZE_HANDLE_SIZE: gpui::Pixels = gpui::px(6.);
+
 /// Marker type for deletion highlighting in left editor (row-level)
 struct DeletionHighlight;
 
@@ -84,8 +97,12 @@ pub struct SideBySideDiffView {
     new_buffer: Entity<Buffer>,
     /// Path being compared
     path: PathBuf,
-    /// Label for the base/left side (e.g., "HEAD", branch name, or commit hash)
+    /// Label for the base/left side (e.g., short commit hash like "a1b2c3d")
     base_label: String,
+    /// Commit message for the base/left side (shown on hover)
+    base_commit_message: Option<String>,
+    /// Left panel width ratio (0.0 - 1.0)
+    left_panel_ratio: f32,
     /// Focus handle for the view
     focus_handle: FocusHandle,
     /// Prevent recursive scroll sync
@@ -107,6 +124,7 @@ impl SideBySideDiffView {
         diff: Entity<BufferDiff>,
         path: PathBuf,
         base_label: String,
+        base_commit_message: Option<String>,
         project: Option<Entity<Project>>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -115,7 +133,7 @@ impl SideBySideDiffView {
 
         // Create left editor (read-only, shows base/old version)
         let left_multibuffer = cx.new(|cx| {
-            let mut mb = MultiBuffer::new(Capability::ReadOnly);
+            let mut mb = MultiBuffer::without_headers(Capability::ReadOnly);
             mb.push_excerpts(
                 old_buffer.clone(),
                 [ExcerptRange::new(text::Anchor::MIN..text::Anchor::MAX)],
@@ -142,7 +160,7 @@ impl SideBySideDiffView {
         // Note: We don't use add_diff() here because we want to handle highlighting ourselves
         // The built-in diff shows deletions in the new buffer, but we want deletions in the left side
         let right_multibuffer = cx.new(|cx| {
-            let mut mb = MultiBuffer::new(Capability::ReadWrite);
+            let mut mb = MultiBuffer::without_headers(Capability::ReadWrite);
             mb.push_excerpts(
                 new_buffer.clone(),
                 [ExcerptRange::new(text::Anchor::MIN..text::Anchor::MAX)],
@@ -237,6 +255,8 @@ impl SideBySideDiffView {
             new_buffer,
             path,
             base_label,
+            base_commit_message,
+            left_panel_ratio: 0.5,
             focus_handle,
             is_syncing_scroll: Cell::new(false),
             left_alignment_blocks: Vec::new(),
@@ -257,6 +277,7 @@ impl SideBySideDiffView {
         diff: Entity<BufferDiff>,
         path: PathBuf,
         base_label: String,
+        base_commit_message: Option<String>,
         project: Entity<Project>,
         workspace: &mut Workspace,
         window: &mut Window,
@@ -269,6 +290,7 @@ impl SideBySideDiffView {
                 diff,
                 path,
                 base_label,
+                base_commit_message,
                 Some(project),
                 window,
                 cx,
@@ -772,6 +794,40 @@ impl SideBySideDiffView {
         (has_prev, has_next)
     }
 
+    /// Get the total number of hunks (differences) in the diff
+    fn hunk_count(&self, cx: &App) -> usize {
+        let new_buffer_snapshot = self.new_buffer.read(cx).snapshot();
+        let diff_snapshot = self.diff.read(cx).snapshot(cx);
+        diff_snapshot.hunks(&new_buffer_snapshot).count()
+    }
+
+    /// Get the current hunk index (1-based) and whether cursor is inside a hunk
+    #[allow(dead_code)]
+    fn current_hunk_index(&self, cx: &App) -> Option<usize> {
+        let new_buffer_snapshot = self.new_buffer.read(cx).snapshot();
+        let diff_snapshot = self.diff.read(cx).snapshot(cx);
+        let hunks: Vec<_> = diff_snapshot.hunks(&new_buffer_snapshot).collect();
+
+        if hunks.is_empty() {
+            return None;
+        }
+
+        // Get current cursor position in the right editor (new buffer)
+        let right_editor = self.right_editor.read(cx);
+        let mb_snapshot = right_editor.buffer().read(cx).snapshot(cx);
+        let newest_anchor = right_editor.selections.newest_anchor();
+        let current_row = newest_anchor.head().to_point(&mb_snapshot).row;
+
+        // Find the first hunk that starts at or after current row, 
+        // or the last hunk that starts before current row
+        for (i, hunk) in hunks.iter().enumerate() {
+            if hunk.range.start.row <= current_row && current_row <= hunk.range.end.row {
+                return Some(i + 1); // 1-based index
+            }
+        }
+        None
+    }
+
     /// Navigate to the next hunk in the diff
     fn go_to_next_hunk(&mut self, _: &GoToNextHunk, window: &mut Window, cx: &mut Context<Self>) {
         self.navigate_to_hunk(true, window, cx);
@@ -902,12 +958,22 @@ impl Render for SideBySideDiffView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
-        // Get the filename for display
-        let filename = self.path.file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "file".to_string());
-        let left_title = format!("{} @ {} (Read-only)", filename, self.base_label);
-        let right_title = format!("{} (Worktree)", filename);
+        // Get relative path for display (IntelliJ style)
+        let relative_path = self.path.to_string_lossy().to_string();
+        
+        // Get hunk count for display
+        let hunk_count = self.hunk_count(cx);
+        let hunk_label = if hunk_count == 1 {
+            "1 difference".to_string()
+        } else {
+            format!("{} differences", hunk_count)
+        };
+        
+        // Calculate hunk navigation state
+        let (has_prev, has_next) = self.hunk_navigation_state(cx);
+        let focus_handle = self.focus_handle.clone();
+        let base_label = self.base_label.clone();
+        let base_commit_message = self.base_commit_message.clone();
         
         div()
             .id("side-by-side-diff-view")
@@ -917,66 +983,61 @@ impl Render for SideBySideDiffView {
             .on_action(cx.listener(Self::go_to_previous_hunk))
             .size_full()
             .flex()
-            .flex_row()
+            .flex_col()
             .bg(theme.colors().editor_background)
-            // Left panel header + editor
+            // Top header bar (IntelliJ style)
             .child(
                 div()
-                    .flex_1()
+                    .h(px(32.))
+                    .px_2()
                     .flex()
-                    .flex_col()
-                    .border_r_1()
+                    .items_center()
+                    .justify_between()
+                    .bg(theme.colors().title_bar_background)
+                    .border_b_1()
                     .border_color(theme.colors().border)
-                    // Header
+                    // Left side: base label + path
                     .child(
                         div()
-                            .h(px(32.))
-                            .px_2()
                             .flex()
                             .items_center()
-                            .bg(theme.colors().title_bar_background)
-                            .border_b_1()
-                            .border_color(theme.colors().border)
+                            .gap_2()
+                            // Base label (e.g., commit hash) with tooltip showing commit message
+                            .child({
+                                let label = Label::new(base_label.clone())
+                                    .size(ui::LabelSize::Small)
+                                    .color(Color::Accent);
+                                
+                                if let Some(commit_msg) = base_commit_message {
+                                    // Show commit message on hover
+                                    div()
+                                        .id("base-label")
+                                        .child(label)
+                                        .tooltip(Tooltip::text(commit_msg))
+                                } else {
+                                    div()
+                                        .id("base-label")
+                                        .child(label)
+                                }
+                            })
+                            // Relative path
                             .child(
-                                Label::new(left_title)
+                                Label::new(relative_path.clone())
                                     .size(ui::LabelSize::Small)
                                     .color(Color::Muted),
                             )
                     )
-                    // Left editor
+                    // Right side: hunk count + navigation buttons
                     .child(
                         div()
-                            .flex_1()
-                            .child(self.left_editor.clone())
-                    )
-            )
-            // Center gutter with connectors (optional)
-            // .child(self.render_diff_gutter(cx))
-            // Right panel header + editor
-            .child({
-                // Calculate hunk navigation state
-                let (has_prev, has_next) = self.hunk_navigation_state(cx);
-                let focus_handle = self.focus_handle.clone();
-                
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    // Header with navigation buttons
-                    .child(
-                        div()
-                            .h(px(32.))
-                            .px_2()
                             .flex()
                             .items_center()
-                            .justify_between()
-                            .bg(theme.colors().title_bar_background)
-                            .border_b_1()
-                            .border_color(theme.colors().border)
+                            .gap_2()
+                            // Hunk count
                             .child(
-                                Label::new(right_title.clone())
+                                Label::new(hunk_label)
                                     .size(ui::LabelSize::Small)
-                                    .color(Color::Accent),
+                                    .color(Color::Muted),
                             )
                             // Navigation buttons
                             .child(
@@ -1011,11 +1072,115 @@ impl Render for SideBySideDiffView {
                                     )
                             )
                     )
-                    // Right editor
+            )
+            // Editors container with draggable divider
+            .child({
+                let border_color = theme.colors().border;
+                let left_ratio = self.left_panel_ratio;
+                let right_ratio = 1.0 - left_ratio;
+                
+                div()
+                    .id("editors-container")
+                    .flex_1()
+                    .flex()
+                    .flex_row()
+                    .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<DraggedDivider>, _window, cx| {
+                        // Calculate new ratio based on drag position relative to container bounds
+                        let container_width: f32 = e.bounds.size.width.into();
+                        if container_width > 0.0 {
+                            // Calculate position relative to container's left edge
+                            let position_x: f32 = e.event.position.x.into();
+                            let origin_x: f32 = e.bounds.origin.x.into();
+                            let relative_x = position_x - origin_x;
+                            let new_ratio = (relative_x / container_width).clamp(0.2, 0.8);
+                            this.left_panel_ratio = new_ratio;
+                            cx.notify();
+                        }
+                    }))
+                    // Left panel: base version
                     .child(
                         div()
-                            .flex_1()
-                            .child(self.right_editor.clone())
+                            .flex_grow()
+                            .flex_shrink()
+                            .flex_basis(relative(left_ratio))
+                            .min_w(px(100.))
+                            .flex()
+                            .flex_col()
+                            // Small label for read-only indicator
+                            .child(
+                                div()
+                                    .h(px(24.))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .bg(theme.colors().surface_background)
+                                    .border_b_1()
+                                    .border_color(border_color)
+                                    .child(
+                                        Label::new(format!("{} (Read-only)", base_label))
+                                            .size(ui::LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                            )
+                            // Left editor
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(self.left_editor.clone())
+                            )
+                    )
+                    // Draggable divider
+                    .child(
+                        div()
+                            .id("divider-handle")
+                            .w(RESIZE_HANDLE_SIZE)
+                            .h_full()
+                            .cursor_col_resize()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .on_drag(DraggedDivider, |_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.new(|_| DraggedDivider)
+                            })
+                            .child(
+                                div()
+                                    .w(px(1.))
+                                    .h_full()
+                                    .bg(border_color)
+                            )
+                    )
+                    // Right panel: worktree version
+                    .child(
+                        div()
+                            .flex_grow()
+                            .flex_shrink()
+                            .flex_basis(relative(right_ratio))
+                            .min_w(px(100.))
+                            .flex()
+                            .flex_col()
+                            // Small label
+                            .child(
+                                div()
+                                    .h(px(24.))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .bg(theme.colors().surface_background)
+                                    .border_b_1()
+                                    .border_color(border_color)
+                                    .child(
+                                        Label::new("Worktree")
+                                            .size(ui::LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                            )
+                            // Right editor
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(self.right_editor.clone())
+                            )
                     )
             })
     }
