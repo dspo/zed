@@ -1060,6 +1060,39 @@ impl GitStore {
         })
     }
 
+    /// Load merge stage texts from Git index for a conflicted file.
+    /// Returns (base_text, ours_text, theirs_text) - the full file content from each Git stage.
+    /// Stage 1 = base (common ancestor), Stage 2 = ours (current branch), Stage 3 = theirs (incoming branch)
+    pub fn load_merge_stage_texts(
+        &self,
+        repo: &Entity<Repository>,
+        repo_path: RepoPath,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(Option<String>, Option<String>, Option<String>)>> {
+        let repo = repo.downgrade();
+        cx.spawn(async move |_, cx| {
+            let repository_state = repo
+                .update(cx, |repo, _| repo.repository_state.clone())?
+                .await
+                .map_err(|err| anyhow::anyhow!(err))?;
+            match repository_state {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    // Load all three stages in parallel
+                    let (base_text, ours_text, theirs_text) = futures::join!(
+                        backend.load_merge_stage_text(repo_path.clone(), 1),
+                        backend.load_merge_stage_text(repo_path.clone(), 2),
+                        backend.load_merge_stage_text(repo_path.clone(), 3)
+                    );
+                    Ok((base_text, ours_text, theirs_text))
+                }
+                RepositoryState::Remote(_) => {
+                    // Remote repositories don't support loading merge stages yet
+                    Ok((None, None, None))
+                }
+            }
+        })
+    }
+
     pub fn file_history(
         &self,
         repo: &Entity<Repository>,

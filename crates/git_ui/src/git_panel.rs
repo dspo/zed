@@ -1339,8 +1339,9 @@ impl GitPanel {
                 return None;
             }
             
-            let active_repo = self.active_repository.as_ref()?;
+            let active_repo = self.active_repository.as_ref()?.clone();
             let project = self.project.clone();
+            let repo_path = entry.repo_path.clone();
             
             // Get the file path
             let path = active_repo
@@ -1354,9 +1355,14 @@ impl GitPanel {
                 project.open_buffer(path.clone(), cx)
             });
             
+            // Load merge stage texts via GitStore
+            let git_store = project.read(cx).git_store().clone();
+            let load_stage_texts_task = git_store.update(cx, |git_store, cx| {
+                git_store.load_merge_stage_texts(&active_repo, repo_path.clone(), cx)
+            });
+            
             let project_clone = project.clone();
             let workspace_weak = self.workspace.clone();
-            let git_store = project.read(cx).git_store().clone();
             let mut async_cx = window.to_async(cx);
             
             cx.spawn_in(window, async move |_, _cx| {
@@ -1368,13 +1374,23 @@ impl GitPanel {
                 })?;
                 
                 // Get the first conflict region (if any)
-                let conflict = conflict_set.update(&mut async_cx, |conflict_set, _cx| {
+                let mut conflict = conflict_set.update(&mut async_cx, |conflict_set, _cx| {
                     conflict_set.snapshot.conflicts.first().cloned()
                 })?;
                 
-                let Some(conflict) = conflict else {
+                let Some(ref mut conflict_ref) = conflict else {
                     return anyhow::Ok(());
                 };
+                
+                // Load the full stage texts from Git if not already loaded
+                if !conflict_ref.has_stage_texts() {
+                    let (base_text, ours_text, theirs_text) = load_stage_texts_task.await?;
+                    conflict_ref.base_text = base_text;
+                    conflict_ref.ours_text = ours_text;
+                    conflict_ref.theirs_text = theirs_text;
+                }
+                
+                let conflict = conflict.unwrap();
                 
                 workspace_weak.update_in(&mut async_cx, |workspace, window, cx| {
                     crate::three_way_merge_editor::ThreeWayMergeEditor::open(
