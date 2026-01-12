@@ -29,6 +29,10 @@ impl FeatureFlag for SplitDiffFeatureFlag {
     fn enabled_for_staff() -> bool {
         true
     }
+
+    fn enabled_for_all() -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Action, Default)]
@@ -45,6 +49,7 @@ pub struct SplittableEditor {
     secondary: Option<SecondaryEditor>,
     panes: PaneGroup,
     workspace: WeakEntity<Workspace>,
+    is_syncing_scroll: std::cell::Cell<bool>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -106,10 +111,11 @@ impl SplittableEditor {
             pane
         });
         let panes = PaneGroup::new(pane);
-        // TODO(split-diff) we might want to tag editor events with whether they came from primary/secondary
-        let subscriptions = vec![cx.subscribe(
+        // Subscribe to primary editor events
+        let subscriptions = vec![cx.subscribe_in(
             &primary_editor,
-            |this, _, event: &EditorEvent, cx| match event {
+            window,
+            |this, _, event: &EditorEvent, window, cx| match event {
                 EditorEvent::ExpandExcerptsRequested {
                     excerpt_ids,
                     lines,
@@ -120,6 +126,23 @@ impl SplittableEditor {
                 EditorEvent::SelectionsChanged { .. } => {
                     if let Some(secondary) = &mut this.secondary {
                         secondary.has_latest_selection = false;
+                    }
+                    cx.emit(event.clone());
+                }
+                // 同步滚动：primary → secondary
+                EditorEvent::ScrollPositionChanged { local: true, autoscroll: false } => {
+                    // 防止无限循环滚动
+                    if !this.is_syncing_scroll.get() {
+                        if let Some(secondary) = &this.secondary {
+                            this.is_syncing_scroll.set(true);
+                            let scroll_position = this.primary_editor.update(cx, |editor, cx| {
+                                editor.scroll_position(cx)
+                            });
+                            secondary.editor.update(cx, |editor, cx| {
+                                editor.set_scroll_position(scroll_position, window, cx);
+                            });
+                            this.is_syncing_scroll.set(false);
+                        }
                     }
                     cx.emit(event.clone());
                 }
@@ -146,8 +169,14 @@ impl SplittableEditor {
             secondary: None,
             panes,
             workspace: workspace.downgrade(),
+            is_syncing_scroll: std::cell::Cell::new(false),
             _subscriptions: subscriptions,
         }
+    }
+
+    /// 公共方法：激活 split diff 视图
+    pub fn activate_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.split(&SplitDiff, window, cx);
     }
 
     fn split(&mut self, _: &SplitDiff, window: &mut Window, cx: &mut Context<Self>) {
@@ -201,9 +230,11 @@ impl SplittableEditor {
             pane
         });
 
-        let subscriptions = vec![cx.subscribe(
+        let primary_editor_for_sync = self.primary_editor.clone();
+        let subscriptions = vec![cx.subscribe_in(
             &secondary_editor,
-            |this, _, event: &EditorEvent, cx| match event {
+            window,
+            move |this, _, event: &EditorEvent, window, cx| match event {
                 EditorEvent::ExpandExcerptsRequested {
                     excerpt_ids,
                     lines,
@@ -220,6 +251,23 @@ impl SplittableEditor {
                 EditorEvent::SelectionsChanged { .. } => {
                     if let Some(secondary) = &mut this.secondary {
                         secondary.has_latest_selection = true;
+                    }
+                    cx.emit(event.clone());
+                }
+                // 同步滚动：secondary → primary
+                EditorEvent::ScrollPositionChanged { local: true, autoscroll: false } => {
+                    // 防止无限循环滚动
+                    if !this.is_syncing_scroll.get() {
+                        if let Some(secondary) = &this.secondary {
+                            this.is_syncing_scroll.set(true);
+                            let scroll_position = secondary.editor.update(cx, |editor, cx| {
+                                editor.scroll_position(cx)
+                            });
+                            primary_editor_for_sync.update(cx, |editor, cx| {
+                                editor.set_scroll_position(scroll_position, window, cx);
+                            });
+                            this.is_syncing_scroll.set(false);
+                        }
                     }
                     cx.emit(event.clone());
                 }

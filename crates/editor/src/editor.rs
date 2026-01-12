@@ -1076,6 +1076,10 @@ pub struct Editor {
     show_line_numbers: Option<bool>,
     use_relative_line_numbers: Option<bool>,
     show_git_diff_gutter: Option<bool>,
+    /// When true, clicking on a diff hunk shows a context menu instead of toggling inline diff
+    show_hunk_context_menu_on_click: bool,
+    /// Optional paired editor to keep in sync for hunk navigation
+    linked_editor: Option<Entity<Editor>>,
     show_code_actions: Option<bool>,
     show_runnables: Option<bool>,
     show_breakpoints: Option<bool>,
@@ -2241,6 +2245,8 @@ impl Editor {
             disable_expand_excerpt_buttons: !full_mode,
             delegate_expand_excerpts: false,
             show_git_diff_gutter: None,
+            show_hunk_context_menu_on_click: false,
+            linked_editor: None,
             show_code_actions: None,
             show_runnables: None,
             show_breakpoints: None,
@@ -16955,39 +16961,49 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
-        let row = if direction == Direction::Next {
-            self.hunk_after_position(snapshot, position)
-                .map(|hunk| hunk.row_range.start)
-        } else {
-            self.hunk_before_position(snapshot, position)
+        let hunks = Self::collect_diff_hunks(snapshot);
+        let Some(target_index) = Self::target_hunk_index(&hunks, position, direction) else {
+            return;
         };
 
-        if let Some(row) = row {
-            let destination = Point::new(row.0, 0);
-            let autoscroll = Autoscroll::center();
+        let Some(target_hunk) = hunks.get(target_index) else {
+            return;
+        };
 
-            self.unfold_ranges(&[destination..destination], false, false, cx);
-            self.change_selections(SelectionEffects::scroll(autoscroll), window, cx, |s| {
-                s.select_ranges([destination..destination]);
+        let destination = Point::new(target_hunk.row_range.start.0, 0);
+        let autoscroll = Autoscroll::center();
+
+        self.unfold_ranges(&[destination..destination], false, false, cx);
+        self.change_selections(SelectionEffects::scroll(autoscroll), window, cx, |s| {
+            s.select_ranges([destination..destination]);
+        });
+
+        // For linked editors (side-by-side diff), only sync scroll position, not cursor.
+        // The linked editor has different hunks, so we just keep scroll in sync.
+        if let Some(linked) = self.linked_editor() {
+            let linked = linked.clone();
+            let this = cx.entity().downgrade();
+            println!("[Editor] Syncing scroll position to linked editor deferred");
+            window.defer(cx, move |window, cx| {
+                if let Some(editor) = this.upgrade() {
+                    let scroll_position = editor.update(cx, |e, cx| e.scroll_position(cx));
+                    linked.update(cx, |other, cx| {
+                        other.set_scroll_position(scroll_position, window, cx);
+                    });
+                }
             });
+            // let scroll_position = self.scroll_position(cx);
+            // linked.update(cx, |other, cx| {
+            //     other.set_scroll_position(scroll_position, window, cx);
+            // });
         }
     }
 
-    fn hunk_after_position(
-        &mut self,
-        snapshot: &EditorSnapshot,
-        position: Point,
-    ) -> Option<MultiBufferDiffHunk> {
+    fn collect_diff_hunks(snapshot: &EditorSnapshot) -> Vec<MultiBufferDiffHunk> {
         snapshot
             .buffer_snapshot()
-            .diff_hunks_in_range(position..snapshot.buffer_snapshot().max_point())
-            .find(|hunk| hunk.row_range.start.0 > position.row)
-            .or_else(|| {
-                snapshot
-                    .buffer_snapshot()
-                    .diff_hunks_in_range(Point::zero()..position)
-                    .find(|hunk| hunk.row_range.end.0 < position.row)
-            })
+            .diff_hunks_in_range(Point::zero()..snapshot.buffer_snapshot().max_point())
+            .collect()
     }
 
     fn go_to_prev_hunk(
@@ -17008,15 +17024,46 @@ impl Editor {
         );
     }
 
-    fn hunk_before_position(
-        &mut self,
-        snapshot: &EditorSnapshot,
+    fn target_hunk_index(
+        hunks: &[MultiBufferDiffHunk],
         position: Point,
-    ) -> Option<MultiBufferRow> {
-        snapshot
-            .buffer_snapshot()
-            .diff_hunk_before(position)
-            .or_else(|| snapshot.buffer_snapshot().diff_hunk_before(Point::MAX))
+        direction: Direction,
+    ) -> Option<usize> {
+        if hunks.is_empty() {
+            return None;
+        }
+
+        let row = position.row;
+        let current = hunks.iter().position(|hunk| {
+            let start = hunk.row_range.start.0;
+            let end = hunk.row_range.end.0;
+            row >= start && row < end
+        });
+
+        match direction {
+            Direction::Next => {
+                if let Some(idx) = current {
+                    (idx + 1 < hunks.len()).then_some(idx + 1)
+                } else {
+                    hunks
+                        .iter()
+                        .enumerate()
+                        .find(|(_, hunk)| hunk.row_range.start.0 > row)
+                        .map(|(idx, _)| idx)
+                }
+            }
+            Direction::Prev => {
+                if let Some(idx) = current {
+                    idx.checked_sub(1)
+                } else {
+                    hunks
+                        .iter()
+                        .enumerate()
+                        .rfind(|(_, hunk)| hunk.row_range.end.0 <= row)
+                        .map(|(idx, _)| idx)
+                }
+            }
+        }
     }
 
     fn go_to_next_change(
@@ -20127,6 +20174,32 @@ impl Editor {
         })
     }
 
+    /// Show a context menu when clicking on a diff hunk (for side-by-side diff view)
+    pub fn show_hunk_context_menu(
+        &mut self,
+        hunk_range: Range<Anchor>,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focus_handle = self.focus_handle.clone();
+
+        let context_menu = ui::ContextMenu::build(window, cx, |menu, _, _cx| {
+            menu.on_blur_subscription(Subscription::new(|| {}))
+                .context(focus_handle)
+                .action("Revert ^ ⌘ →", Restore.boxed_clone())
+        });
+
+        self.mouse_context_menu = MouseContextMenu::pinned_to_editor(
+            self,
+            hunk_range.start,
+            position,
+            context_menu,
+            window,
+            cx,
+        );
+    }
+
     pub(crate) fn apply_all_diff_hunks(
         &mut self,
         _: &ApplyAllDiffHunks,
@@ -20697,6 +20770,25 @@ impl Editor {
     pub fn set_show_git_diff_gutter(&mut self, show_git_diff_gutter: bool, cx: &mut Context<Self>) {
         self.show_git_diff_gutter = Some(show_git_diff_gutter);
         cx.notify();
+    }
+
+    /// When set to true, clicking on a diff hunk will show a context menu
+    /// with Revert, Prev Hunk, Next Hunk options instead of toggling inline diff
+    pub fn set_show_hunk_context_menu_on_click(&mut self, enabled: bool) {
+        self.show_hunk_context_menu_on_click = enabled;
+    }
+
+    pub fn show_hunk_context_menu_on_click(&self) -> bool {
+        self.show_hunk_context_menu_on_click
+    }
+
+    /// Link this editor with another for synchronized hunk navigation.
+    pub fn set_linked_editor(&mut self, other: Option<Entity<Editor>>) {
+        self.linked_editor = other;
+    }
+
+    pub fn linked_editor(&self) -> Option<Entity<Editor>> {
+        self.linked_editor.clone()
     }
 
     pub fn set_show_code_actions(&mut self, show_code_actions: bool, cx: &mut Context<Self>) {

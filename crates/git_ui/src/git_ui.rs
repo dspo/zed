@@ -46,8 +46,11 @@ pub mod picker_prompt;
 pub mod project_diff;
 pub(crate) mod remote_output;
 pub mod repository_selector;
+pub mod side_by_side_diff_view;
 pub mod stash_picker;
 pub mod text_diff_view;
+pub mod three_way_merge_editor;
+pub mod three_way_merge_view;
 pub mod worktree_picker;
 
 actions!(
@@ -62,6 +65,7 @@ pub fn init(cx: &mut App) {
     editor::set_blame_renderer(blame_ui::GitBlameRenderer, cx);
     commit_view::init(cx);
     file_history_view::init(cx);
+    side_by_side_diff_view::init(cx);
 
     cx.observe_new(|editor: &mut Editor, _, cx| {
         conflict_view::register_editor(editor, editor.buffer().clone(), cx);

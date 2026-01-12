@@ -420,6 +420,14 @@ pub trait GitRepository: Send + Sync {
     /// Also returns `None` for symlinks.
     fn load_index_text(&self, path: RepoPath) -> BoxFuture<'_, Option<String>>;
 
+    /// Returns the contents of a merge stage for the given path.
+    /// Stage 1 = common ancestor (base)
+    /// Stage 2 = our version (HEAD)
+    /// Stage 3 = their version (MERGE_HEAD)
+    ///
+    /// Returns `None` if there is no entry for the given stage or for symlinks.
+    fn load_merge_stage_text(&self, path: RepoPath, stage: i32) -> BoxFuture<'_, Option<String>>;
+
     /// Returns the contents of an entry in the repository's HEAD, or None if HEAD does not exist or has no entry for the given path.
     ///
     /// Also returns `None` for symlinks.
@@ -1034,6 +1042,45 @@ impl GitRepository for RealGitRepository {
                 match logic(&repo.lock(), &path) {
                     Ok(value) => return value,
                     Err(err) => log::error!("Error loading index text: {:?}", err),
+                }
+                None
+            })
+            .boxed()
+    }
+
+    fn load_merge_stage_text(&self, path: RepoPath, stage: i32) -> BoxFuture<'_, Option<String>> {
+        const GIT_MODE_SYMLINK: u32 = 0o120000;
+
+        let repo = self.repository.clone();
+        self.executor
+            .spawn(async move {
+                fn logic(
+                    repo: &git2::Repository,
+                    path: &RepoPath,
+                    stage: i32,
+                ) -> Result<Option<String>> {
+                    let mut index = repo.index()?;
+                    index.read(false)?;
+
+                    let path = path.as_std_path();
+                    let path = if path.components().next().is_none() {
+                        ".".as_ref()
+                    } else {
+                        path
+                    };
+
+                    let oid = match index.get_path(path, stage) {
+                        Some(entry) if entry.mode != GIT_MODE_SYMLINK => entry.id,
+                        _ => return Ok(None),
+                    };
+
+                    let content = repo.find_blob(oid)?.content().to_owned();
+                    Ok(String::from_utf8(content).ok())
+                }
+
+                match logic(&repo.lock(), &path, stage) {
+                    Ok(value) => return value,
+                    Err(err) => log::error!("Error loading merge stage {} text: {:?}", stage, err),
                 }
                 None
             })
