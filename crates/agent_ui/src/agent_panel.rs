@@ -2145,8 +2145,17 @@ impl AgentPanel {
         let project = self.project.clone();
 
         cx.spawn_in(window, async move |this, cx| {
+            let working_directory = workspace
+                .read_with(cx, |workspace, cx| {
+                    terminal_view::default_working_directory(workspace, cx)
+                })
+                .ok()
+                .flatten();
+
             let terminal = project
-                .update(cx, |project, cx| project.create_terminal_shell(None, cx))
+                .update(cx, |project, cx| {
+                    project.create_terminal_shell(working_directory, cx)
+                })
                 .await?;
 
             this.update_in(cx, |this, window, cx| {
@@ -2299,8 +2308,7 @@ impl Panel for AgentPanel {
 
     fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
         if active && matches!(self.active_view, ActiveView::Uninitialized) {
-            let selected_agent = self.selected_agent.clone();
-            self.new_agent_thread(selected_agent, window, cx);
+            self.new_terminal(window, cx);
         }
     }
 
