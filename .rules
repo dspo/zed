@@ -1,3 +1,81 @@
+# CLAUDE.md
+
+This file provides guidance for AI assistants working on the Zed codebase — a high-performance, GPU-accelerated code editor written in Rust.
+
+# Build & Development Commands
+
+## Building
+
+- `cargo build` — builds the default member (`crates/zed`)
+- `cargo build -p <crate>` — builds a specific crate
+- `cargo run` — builds and runs Zed
+
+## Testing
+
+- `cargo test -p <crate>` — run tests for a specific crate
+- `cargo test -p <crate> -- <test_name>` — run a single test
+- `cargo test -p <crate> -- --nocapture` — run tests with stdout visible
+- Avoid `cargo test --workspace` — the workspace has 200+ crates; always scope tests to the relevant crate
+
+## Linting
+
+- `./script/clippy` — the project's lint script; use this instead of `cargo clippy` directly
+  - Runs clippy with `--release --all-targets --all-features -- --deny warnings`
+  - Defaults to `--workspace` if no `-p`/`--package` is specified
+  - Locally also runs `cargo-machete` (unused deps) and `typos` (spell checking) if installed
+- `./script/clippy -p <crate>` — lint a specific crate
+
+## Creating New Crates
+
+- Use `./script/new-crate <name>` to scaffold a new workspace crate
+
+## Other Useful Scripts
+
+- `./script/bootstrap` — initial project setup
+- `cargo xtask` — project-specific task runner
+- `cargo perf-test` — performance testing (release-fast profile)
+
+# Codebase Architecture
+
+## Toolchain
+
+- Rust edition: **2024**, toolchain channel: **1.93**
+- Workspace resolver: `2`, with 200+ crates under `crates/`
+
+## Key Crates (dependency layers, top to bottom)
+
+| Layer | Crates | Role |
+|-------|--------|------|
+| App entry | `zed` | Main binary, wires everything together |
+| Features | `editor`, `terminal_view`, `vim`, `collab_ui`, `agent_ui`, `extensions_ui`, `diagnostics` | User-facing feature crates |
+| Domain | `project`, `workspace`, `language`, `lsp`, `collab`, `terminal`, `agent` | Core domain logic |
+| UI toolkit | `ui`, `theme`, `gpui` | Component library, theming, GPU-accelerated UI framework |
+| Primitives | `rope`, `text`, `collections`, `util`, `fs`, `git`, `clock`, `paths`, `rpc` | Low-level shared utilities |
+
+## Dependency Flow
+
+`zed` → feature crates → domain crates → `gpui` / `ui` → primitives
+
+Feature crates depend on domain crates but not on each other. `gpui` is the foundational UI framework that most crates depend on.
+
+# Workspace Configuration
+
+## Denied Clippy Lints
+
+These lints are **denied** in the workspace — CI will fail if they appear:
+
+- `clippy::dbg_macro` — no `dbg!()` in committed code
+- `clippy::todo` — no `todo!()` in committed code
+- `clippy::declare_interior_mutable_const` — avoid interior mutability in constants
+- `clippy::redundant_clone` — no unnecessary `.clone()` calls
+- `clippy::disallowed_methods` — certain methods are banned project-wide
+
+## Allowed Clippy Lints
+
+These are explicitly allowed (do not try to "fix" them):
+
+- `clippy::style` (priority -1), `clippy::type_complexity`, `clippy::too_many_arguments`, `clippy::large_enum_variant`, `clippy::nonminimal_bool`, `clippy::let_underscore_future`, `clippy::single_range_in_vec_init`
+
 # Rust coding guidelines
 
 * Prioritize code correctness and clarity. Speed and efficiency are secondary priorities unless otherwise specified.
@@ -133,6 +211,3 @@ While updating an entity (`cx: Context<T>`), it can emit an event using `cx.emit
 
 Other entities can then register a callback to handle these events by doing `cx.subscribe(other_entity, |this, other_entity, event, cx| ...)`. This will return a `Subscription` which deregisters the callback when dropped.  Typically `cx.subscribe` happens when creating a new entity and the subscriptions are stored in a `_subscriptions: Vec<Subscription>` field.
 
-## Build guidelines
-
-- Use `./script/clippy` instead of `cargo clippy`
