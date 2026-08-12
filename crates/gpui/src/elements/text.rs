@@ -649,7 +649,11 @@ impl TextLayout {
             move |known_dimensions, available_space, window, cx| {
                 let wrap_width = if text_style.white_space == WhiteSpace::Normal {
                     known_dimensions.width.or(match available_space.width {
-                        crate::AvailableSpace::Definite(x) => Some(x),
+                        // Treat a zero definite width as unknown: Taffy's
+                        // flex-base pass during MinContent height measurement
+                        // can cascade a zero width down to this leaf, which
+                        // would otherwise char-wrap into an unbounded height.
+                        crate::AvailableSpace::Definite(x) if x.0 > 0.0 => Some(x),
                         _ => None,
                     })
                 } else {
